@@ -704,6 +704,270 @@ def build_javier_statement_dataframe():
 
 
 
+
+# =========================================================
+# BACKUP / IMPORTACION
+# =========================================================
+
+BACKUP_VERSION = "1.0"
+
+
+def model_to_dict(obj, fields):
+    data = {}
+    for field in fields:
+        value = getattr(obj, field)
+        if isinstance(value, (date, datetime)):
+            value = value.isoformat()
+        data[field] = value
+    return data
+
+
+def parse_date_value(value):
+    if not value:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    return date.fromisoformat(str(value)[:10])
+
+
+def parse_datetime_value(value):
+    if not value:
+        return datetime.utcnow()
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value).replace("Z", ""))
+
+
+def export_database_backup():
+    """
+    Exporta toda la base de datos a JSON.
+    No exporta contraseñas en texto plano, solo el hash existente.
+    """
+    db = SessionLocal()
+    try:
+        data = {
+            "backup_version": BACKUP_VERSION,
+            "generated_at": datetime.utcnow().isoformat(),
+            "app": APP_NAME,
+            "tables": {
+                "users": [],
+                "settings": [],
+                "sales": [],
+                "expenses": [],
+                "payments": [],
+                "monthly_closes": [],
+                "audit_logs": [],
+            }
+        }
+
+        data["tables"]["users"] = [
+            model_to_dict(u, ["id", "username", "name", "password_hash", "role", "active", "created_at"])
+            for u in db.query(User).order_by(User.id.asc()).all()
+        ]
+
+        data["tables"]["settings"] = [
+            model_to_dict(s, ["key", "value"])
+            for s in db.query(Setting).order_by(Setting.key.asc()).all()
+        ]
+
+        data["tables"]["sales"] = [
+            model_to_dict(s, ["id", "sale_date", "meters", "notes", "created_by", "created_at"])
+            for s in db.query(Sale).order_by(Sale.id.asc()).all()
+        ]
+
+        data["tables"]["expenses"] = [
+            model_to_dict(e, ["id", "expense_date", "category", "amount", "paid_by", "platform", "reference", "notes", "created_by", "created_at"])
+            for e in db.query(Expense).order_by(Expense.id.asc()).all()
+        ]
+
+        data["tables"]["payments"] = [
+            model_to_dict(p, ["id", "payment_date", "partner", "amount", "platform", "reference", "notes", "created_by", "created_at"])
+            for p in db.query(Payment).order_by(Payment.id.asc()).all()
+        ]
+
+        data["tables"]["monthly_closes"] = [
+            model_to_dict(c, [
+                "id", "period_key", "start_date", "end_date", "total_meters", "revenue",
+                "production_cost", "deductible_expenses", "net_profit_before_roi",
+                "roi_recovery", "distributable_profit", "partner_share",
+                "javier_credit", "rene_credit", "notes", "created_by", "created_at"
+            ])
+            for c in db.query(MonthlyClose).order_by(MonthlyClose.id.asc()).all()
+        ]
+
+        data["tables"]["audit_logs"] = [
+            model_to_dict(a, ["id", "action_date", "username", "module", "action", "record_id", "before_data", "after_data", "reason"])
+            for a in db.query(AuditLog).order_by(AuditLog.id.asc()).all()
+        ]
+
+        return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    finally:
+        db.close()
+
+
+def get_db_counts():
+    db = SessionLocal()
+    try:
+        return {
+            "Usuarios": db.query(User).count(),
+            "Configuraciones": db.query(Setting).count(),
+            "Ventas": db.query(Sale).count(),
+            "Gastos": db.query(Expense).count(),
+            "Abonos": db.query(Payment).count(),
+            "Cierres mensuales": db.query(MonthlyClose).count(),
+            "Auditoría": db.query(AuditLog).count(),
+        }
+    finally:
+        db.close()
+
+
+def validate_backup_payload(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("El archivo no tiene formato JSON válido para backup.")
+    if "tables" not in payload:
+        raise ValueError("El archivo no contiene la clave 'tables'.")
+    required_tables = ["users", "settings", "sales", "expenses", "payments", "monthly_closes", "audit_logs"]
+    for table in required_tables:
+        if table not in payload["tables"]:
+            raise ValueError(f"El backup no contiene la tabla requerida: {table}")
+        if not isinstance(payload["tables"][table], list):
+            raise ValueError(f"La tabla {table} no tiene formato de lista.")
+    return True
+
+
+def clear_database(db):
+    """
+    Limpia tablas en orden seguro.
+    """
+    db.query(AuditLog).delete()
+    db.query(MonthlyClose).delete()
+    db.query(Payment).delete()
+    db.query(Expense).delete()
+    db.query(Sale).delete()
+    db.query(Setting).delete()
+    db.query(User).delete()
+
+
+def import_database_backup(uploaded_bytes, mode="replace"):
+    """
+    Importa un backup JSON.
+    mode='replace': borra la base actual y restaura el backup completo.
+    """
+    payload = json.loads(uploaded_bytes.decode("utf-8-sig"))
+    validate_backup_payload(payload)
+
+    tables = payload["tables"]
+    db = SessionLocal()
+
+    try:
+        if mode == "replace":
+            clear_database(db)
+            db.flush()
+        else:
+            raise ValueError("Por seguridad, actualmente solo está permitido el modo reemplazar.")
+
+        for row in tables["users"]:
+            db.add(User(
+                id=row.get("id"),
+                username=row.get("username"),
+                name=row.get("name"),
+                password_hash=row.get("password_hash"),
+                role=row.get("role", "socio"),
+                active=bool(row.get("active", True)),
+                created_at=parse_datetime_value(row.get("created_at"))
+            ))
+
+        for row in tables["settings"]:
+            db.add(Setting(
+                key=row.get("key"),
+                value=str(row.get("value", ""))
+            ))
+
+        for row in tables["sales"]:
+            db.add(Sale(
+                id=row.get("id"),
+                sale_date=parse_date_value(row.get("sale_date")),
+                meters=float(row.get("meters", 0) or 0),
+                notes=row.get("notes", "") or "",
+                created_by=row.get("created_by", "importado"),
+                created_at=parse_datetime_value(row.get("created_at"))
+            ))
+
+        for row in tables["expenses"]:
+            db.add(Expense(
+                id=row.get("id"),
+                expense_date=parse_date_value(row.get("expense_date")),
+                category=row.get("category", "Otro"),
+                amount=float(row.get("amount", 0) or 0),
+                paid_by=row.get("paid_by", "Empresa"),
+                platform=row.get("platform", "") or "",
+                reference=row.get("reference", "") or "",
+                notes=row.get("notes", "") or "",
+                created_by=row.get("created_by", "importado"),
+                created_at=parse_datetime_value(row.get("created_at"))
+            ))
+
+        for row in tables["payments"]:
+            db.add(Payment(
+                id=row.get("id"),
+                payment_date=parse_date_value(row.get("payment_date")),
+                partner=row.get("partner", "Javier"),
+                amount=float(row.get("amount", 0) or 0),
+                platform=row.get("platform", "Otro"),
+                reference=row.get("reference", "") or "",
+                notes=row.get("notes", "") or "",
+                created_by=row.get("created_by", "importado"),
+                created_at=parse_datetime_value(row.get("created_at"))
+            ))
+
+        for row in tables["monthly_closes"]:
+            db.add(MonthlyClose(
+                id=row.get("id"),
+                period_key=row.get("period_key"),
+                start_date=parse_date_value(row.get("start_date")),
+                end_date=parse_date_value(row.get("end_date")),
+                total_meters=float(row.get("total_meters", 0) or 0),
+                revenue=float(row.get("revenue", 0) or 0),
+                production_cost=float(row.get("production_cost", 0) or 0),
+                deductible_expenses=float(row.get("deductible_expenses", 0) or 0),
+                net_profit_before_roi=float(row.get("net_profit_before_roi", 0) or 0),
+                roi_recovery=float(row.get("roi_recovery", 0) or 0),
+                distributable_profit=float(row.get("distributable_profit", 0) or 0),
+                partner_share=float(row.get("partner_share", 0) or 0),
+                javier_credit=float(row.get("javier_credit", 0) or 0),
+                rene_credit=float(row.get("rene_credit", 0) or 0),
+                notes=row.get("notes", "") or "",
+                created_by=row.get("created_by", "importado"),
+                created_at=parse_datetime_value(row.get("created_at"))
+            ))
+
+        for row in tables["audit_logs"]:
+            db.add(AuditLog(
+                id=row.get("id"),
+                action_date=parse_datetime_value(row.get("action_date")),
+                username=row.get("username", "importado"),
+                module=row.get("module", "Importación"),
+                action=row.get("action", "importado"),
+                record_id=row.get("record_id"),
+                before_data=row.get("before_data", "") or "",
+                after_data=row.get("after_data", "") or "",
+                reason=row.get("reason", "") or "",
+            ))
+
+        db.commit()
+
+        # En SQLite, actualiza secuencias si existen; en PostgreSQL los IDs explícitos suelen funcionar
+        # pero la secuencia puede necesitar reajuste. SQLAlchemy no lo hace automáticamente en todos los motores.
+        return get_db_counts()
+
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+
 # =========================================================
 # UI COMPONENTES
 # =========================================================
@@ -734,7 +998,7 @@ def sidebar(user):
 
     allowed_pages = ["Dashboard", "Cargar venta diaria", "Gastos del equipo", "Cuenta Javier", "Informe mensual", "ROI del equipo"]
     if user["role"] == "admin":
-        allowed_pages += ["Cierre mensual", "Auditoría", "Usuarios", "Configuración", "Base de datos"]
+        allowed_pages += ["Cierre mensual", "Backup / Importar BD", "Auditoría", "Usuarios", "Configuración", "Base de datos"]
 
     page = st.sidebar.radio("Menú", allowed_pages)
 
@@ -1894,6 +2158,95 @@ def page_monthly_close(user):
 
 
 
+
+def page_backup(user):
+    header("Backup / Importar BD", "Exporta o restaura toda la información del sistema.")
+
+    st.warning(
+        "Este módulo es delicado. Antes de importar, descarga un backup de la base actual. "
+        "La importación en modo reemplazar borra la data actual y coloca la del archivo importado."
+    )
+
+    counts = get_db_counts()
+    st.subheader("Resumen actual de la base de datos")
+    c1, c2, c3, c4 = st.columns(4)
+    keys = list(counts.keys())
+    for idx, key in enumerate(keys):
+        with [c1, c2, c3, c4][idx % 4]:
+            metric_card(key, counts[key])
+
+    st.divider()
+
+    st.subheader("Exportar respaldo")
+    backup_bytes = export_database_backup()
+    st.download_button(
+        "Descargar backup completo JSON",
+        data=backup_bytes,
+        file_name=f"backup_dtf_control_roi_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        mime="application/json",
+        width="stretch"
+    )
+
+    st.caption(
+        "El backup incluye usuarios, configuraciones, ventas, gastos, abonos, cierres y auditoría. "
+        "Las claves se exportan como hash, nunca en texto plano."
+    )
+
+    st.divider()
+
+    st.subheader("Importar respaldo")
+    uploaded = st.file_uploader("Selecciona archivo backup JSON", type=["json"])
+    confirm_text = st.text_input(
+        "Para confirmar la importación escribe exactamente: IMPORTAR",
+        placeholder="IMPORTAR"
+    )
+    make_extra_backup = st.checkbox("Entiendo que debo haber descargado un backup antes de importar", value=False)
+
+    if uploaded is not None:
+        try:
+            raw = uploaded.read()
+            preview = json.loads(raw.decode("utf-8-sig"))
+            validate_backup_payload(preview)
+
+            preview_counts = {
+                "Usuarios": len(preview["tables"].get("users", [])),
+                "Configuraciones": len(preview["tables"].get("settings", [])),
+                "Ventas": len(preview["tables"].get("sales", [])),
+                "Gastos": len(preview["tables"].get("expenses", [])),
+                "Abonos": len(preview["tables"].get("payments", [])),
+                "Cierres mensuales": len(preview["tables"].get("monthly_closes", [])),
+                "Auditoría": len(preview["tables"].get("audit_logs", [])),
+            }
+
+            st.success("Archivo válido para importar.")
+            st.write("Contenido del backup seleccionado:")
+            st.dataframe(pd.DataFrame([preview_counts]), width="stretch", hide_index=True)
+
+            if st.button("Importar y reemplazar base actual", width="stretch", type="primary"):
+                if confirm_text.strip() != "IMPORTAR":
+                    st.error("Debes escribir IMPORTAR exactamente para confirmar.")
+                elif not make_extra_backup:
+                    st.error("Marca la casilla indicando que ya descargaste un backup previo.")
+                else:
+                    result_counts = import_database_backup(raw, mode="replace")
+                    audit_log(
+                        user["username"],
+                        "Backup",
+                        "importar base completa",
+                        before=counts,
+                        after=result_counts,
+                        reason="Importación manual desde módulo Backup / Importar BD"
+                    )
+                    st.success("Base de datos importada correctamente. Vuelve a iniciar sesión si notas datos antiguos en pantalla.")
+                    st.dataframe(pd.DataFrame([result_counts]), width="stretch", hide_index=True)
+                    st.session_state.user = None
+                    st.rerun()
+
+        except Exception as e:
+            st.error(f"No se pudo validar o importar el archivo: {e}")
+
+
+
 def page_audit():
     header("Auditoría", "Historial de cambios importantes del sistema.")
 
@@ -2100,6 +2453,8 @@ def main():
         page_roi()
     elif page == "Cierre mensual" and user["role"] == "admin":
         page_monthly_close(user)
+    elif page == "Backup / Importar BD" and user["role"] == "admin":
+        page_backup(user)
     elif page == "Auditoría" and user["role"] == "admin":
         page_audit()
     elif page == "Usuarios" and user["role"] == "admin":
