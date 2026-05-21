@@ -105,3 +105,28 @@ El PDF incluye:
 - abonos registrados
 - saldo actual pendiente
 - referencias y notas de pagos
+
+
+## Fix6 - Informe mensual
+
+Se corrigió el error:
+
+- `NameError: name 'c8' is not defined`
+
+El bloque de métricas del informe mensual ahora define correctamente las columnas de ROI y socios.
+
+
+## Fix7 - Control total financiero
+
+Se agregaron mejoras importantes:
+
+- Estado de cuenta tipo banco para Javier.
+- CSV de movimientos de Javier.
+- PDF preliminar del cierre mensual.
+- Edición y eliminación de ventas.
+- Edición y eliminación de gastos.
+- Motivo obligatorio para eliminar ventas/gastos.
+- Registro de auditoría para cambios importantes.
+- Módulo Auditoría solo para administrador.
+
+Recomendación: para producción en Railway, usar PostgreSQL o volumen persistente para proteger la base de datos.
