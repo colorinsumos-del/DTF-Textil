@@ -2,6 +2,7 @@
 import os
 import secrets
 import hashlib
+import json
 from pathlib import Path
 from datetime import date, datetime
 from io import BytesIO
@@ -153,6 +154,20 @@ class MonthlyClose(Base):
     notes = Column(Text, default="")
     created_by = Column(String(80), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True)
+    action_date = Column(DateTime, default=datetime.utcnow)
+    username = Column(String(80), nullable=False)
+    module = Column(String(80), nullable=False)
+    action = Column(String(80), nullable=False)
+    record_id = Column(Integer, nullable=True)
+    before_data = Column(Text, default="")
+    after_data = Column(Text, default="")
+    reason = Column(Text, default="")
 
 
 # =========================================================
@@ -385,6 +400,47 @@ def payments_dataframe(partner="Javier"):
 
 
 
+
+def get_sale_by_id(sale_id: int):
+    db = SessionLocal()
+    try:
+        s = db.query(Sale).filter(Sale.id == int(sale_id)).first()
+        if not s:
+            return None
+        return {
+            "id": s.id,
+            "sale_date": s.sale_date,
+            "meters": float(s.meters),
+            "notes": s.notes or "",
+            "created_by": s.created_by,
+            "created_at": s.created_at,
+        }
+    finally:
+        db.close()
+
+
+def get_expense_by_id(expense_id: int):
+    db = SessionLocal()
+    try:
+        e = db.query(Expense).filter(Expense.id == int(expense_id)).first()
+        if not e:
+            return None
+        return {
+            "id": e.id,
+            "expense_date": e.expense_date,
+            "category": e.category,
+            "amount": float(e.amount),
+            "paid_by": e.paid_by,
+            "platform": e.platform or "",
+            "reference": e.reference or "",
+            "notes": e.notes or "",
+            "created_by": e.created_by,
+            "created_at": e.created_at,
+        }
+    finally:
+        db.close()
+
+
 def get_payment_by_id(payment_id: int):
     db = SessionLocal()
     try:
@@ -550,6 +606,104 @@ def format_usd(value):
     return f"${value:,.2f}"
 
 
+def audit_log(username, module, action, record_id=None, before=None, after=None, reason=""):
+    db = SessionLocal()
+    try:
+        item = AuditLog(
+            username=username,
+            module=module,
+            action=action,
+            record_id=record_id,
+            before_data=json.dumps(before or {}, default=str, ensure_ascii=False),
+            after_data=json.dumps(after or {}, default=str, ensure_ascii=False),
+            reason=reason or ""
+        )
+        db.add(item)
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+def audit_dataframe(limit=200):
+    db = SessionLocal()
+    try:
+        rows = db.query(AuditLog).order_by(AuditLog.action_date.desc()).limit(limit).all()
+        return pd.DataFrame([
+            {
+                "ID": r.id,
+                "Fecha": r.action_date,
+                "Usuario": r.username,
+                "Módulo": r.module,
+                "Acción": r.action,
+                "Registro": r.record_id,
+                "Motivo": r.reason,
+                "Antes": r.before_data,
+                "Después": r.after_data,
+            }
+            for r in rows
+        ])
+    finally:
+        db.close()
+
+
+def build_javier_statement_dataframe():
+    opening = get_money_setting("opening_debt_javier", 0.0)
+    moves = []
+
+    if opening > 0:
+        moves.append({
+            "Fecha": date.min,
+            "Concepto": "Deuda acumulada inicial",
+            "Debe": opening,
+            "Haber": 0.0,
+            "Referencia": "",
+            "Notas": get_setting("opening_debt_notes", "Deuda acumulada previa al sistema.")
+        })
+
+    closes = closes_dataframe()
+    if not closes.empty:
+        for _, row in closes.iterrows():
+            moves.append({
+                "Fecha": row["Hasta"],
+                "Concepto": f"Corte mensual {row['Periodo']}",
+                "Debe": float(row["Abono/cargo Javier"]),
+                "Haber": 0.0,
+                "Referencia": str(row["Periodo"]),
+                "Notas": str(row["Notas"])
+            })
+
+    payments = payments_dataframe("Javier")
+    if not payments.empty:
+        for _, row in payments.iterrows():
+            moves.append({
+                "Fecha": row["Fecha"],
+                "Concepto": f"Abono recibido por {row['Plataforma']}",
+                "Debe": 0.0,
+                "Haber": float(row["Monto"]),
+                "Referencia": str(row["Referencia"]),
+                "Notas": str(row["Notas"])
+            })
+
+    if not moves:
+        return pd.DataFrame(columns=["Fecha", "Concepto", "Debe", "Haber", "Saldo", "Referencia", "Notas"])
+
+    df = pd.DataFrame(moves)
+    df["FechaOrden"] = pd.to_datetime(df["Fecha"].astype(str).replace("0001-01-01", "1900-01-01"))
+    df = df.sort_values(["FechaOrden", "Concepto"]).drop(columns=["FechaOrden"]).reset_index(drop=True)
+    saldo = 0.0
+    saldos = []
+    for _, row in df.iterrows():
+        saldo += float(row["Debe"]) - float(row["Haber"])
+        saldos.append(saldo)
+    df["Saldo"] = saldos
+    df["Fecha"] = df["Fecha"].apply(lambda x: "Inicial" if str(x) == "0001-01-01" else str(x))
+    return df[["Fecha", "Concepto", "Debe", "Haber", "Saldo", "Referencia", "Notas"]]
+
+
+
+
 # =========================================================
 # UI COMPONENTES
 # =========================================================
@@ -580,7 +734,7 @@ def sidebar(user):
 
     allowed_pages = ["Dashboard", "Cargar venta diaria", "Gastos del equipo", "Cuenta Javier", "Informe mensual", "ROI del equipo"]
     if user["role"] == "admin":
-        allowed_pages += ["Cierre mensual", "Usuarios", "Configuración", "Base de datos"]
+        allowed_pages += ["Cierre mensual", "Auditoría", "Usuarios", "Configuración", "Base de datos"]
 
     page = st.sidebar.radio("Menú", allowed_pages)
 
@@ -652,35 +806,108 @@ def page_dashboard():
 
 
 def page_load_sale(user):
-    header("Cargar venta diaria", "Registra los metros DTF vendidos por fecha.")
+    header("Cargar venta diaria", "Registra, edita o elimina los metros DTF vendidos por fecha.")
 
     price = get_money_setting("price_per_meter", 6.0)
     cost = get_money_setting("cost_per_meter", 2.0)
 
-    with st.form("sale_form"):
-        c1, c2 = st.columns(2)
-        with c1:
-            sale_date = st.date_input("Fecha de venta", value=date.today())
-        with c2:
-            meters = st.number_input("Metros vendidos", min_value=0.01, step=0.10, format="%.2f")
+    tab1, tab2, tab3 = st.tabs(["Registrar venta", "Editar venta", "Eliminar venta"])
 
-        notes = st.text_area("Notas opcionales", placeholder="Ej: venta mostrador, pedido cliente X, rollo completo, etc.")
-        submitted = st.form_submit_button("Guardar venta", width="stretch")
+    with tab1:
+        with st.form("sale_form"):
+            c1, c2 = st.columns(2)
+            with c1:
+                sale_date = st.date_input("Fecha de venta", value=date.today(), key="sale_new_date")
+            with c2:
+                meters = st.number_input("Metros vendidos", min_value=0.01, step=0.10, format="%.2f", key="sale_new_meters")
 
-    if submitted:
-        db = SessionLocal()
-        try:
-            sale = Sale(
-                sale_date=sale_date,
-                meters=float(meters),
-                notes=notes.strip(),
-                created_by=user["username"]
-            )
-            db.add(sale)
-            db.commit()
-            st.success("Venta guardada correctamente.")
-        finally:
-            db.close()
+            notes = st.text_area("Notas opcionales", placeholder="Ej: venta mostrador, pedido cliente X, rollo completo, etc.", key="sale_new_notes")
+            submitted = st.form_submit_button("Guardar venta", width="stretch")
+
+        if submitted:
+            db = SessionLocal()
+            try:
+                sale = Sale(
+                    sale_date=sale_date,
+                    meters=float(meters),
+                    notes=notes.strip(),
+                    created_by=user["username"]
+                )
+                db.add(sale)
+                db.commit()
+                audit_log(user["username"], "Ventas", "crear", sale.id, after={"fecha": sale_date, "metros": meters, "notas": notes})
+                st.success("Venta guardada correctamente.")
+                st.rerun()
+            finally:
+                db.close()
+
+    df_all = sales_dataframe()
+
+    with tab2:
+        if df_all.empty:
+            st.info("No hay ventas para editar.")
+        else:
+            options = {
+                f"ID {int(row['ID'])} · {row['Fecha']} · {float(row['Metros']):,.2f} m · {row['Notas']}": int(row["ID"])
+                for _, row in df_all.iterrows()
+            }
+            label = st.selectbox("Selecciona venta", list(options.keys()), key="edit_sale_select")
+            sale_id = options[label]
+            sale = get_sale_by_id(sale_id)
+            if sale:
+                with st.form(f"edit_sale_form_{sale_id}"):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        edit_date = st.date_input("Fecha", value=sale["sale_date"], key=f"sale_edit_date_{sale_id}")
+                    with c2:
+                        edit_meters = st.number_input("Metros", min_value=0.01, value=sale["meters"], step=0.10, format="%.2f", key=f"sale_edit_meters_{sale_id}")
+                    edit_notes = st.text_area("Notas", value=sale["notes"], key=f"sale_edit_notes_{sale_id}")
+                    save = st.form_submit_button("Guardar cambios", width="stretch")
+                if save:
+                    db = SessionLocal()
+                    try:
+                        s = db.query(Sale).filter(Sale.id == int(sale_id)).first()
+                        before = {"fecha": s.sale_date, "metros": s.meters, "notas": s.notes}
+                        s.sale_date = edit_date
+                        s.meters = float(edit_meters)
+                        s.notes = edit_notes.strip()
+                        db.commit()
+                        audit_log(user["username"], "Ventas", "editar", sale_id, before=before, after={"fecha": edit_date, "metros": edit_meters, "notas": edit_notes})
+                        st.success("Venta actualizada.")
+                        st.rerun()
+                    finally:
+                        db.close()
+
+    with tab3:
+        if user["role"] != "admin":
+            st.warning("Solo un administrador puede eliminar ventas.")
+        elif df_all.empty:
+            st.info("No hay ventas para eliminar.")
+        else:
+            options = {
+                f"ID {int(row['ID'])} · {row['Fecha']} · {float(row['Metros']):,.2f} m · {row['Notas']}": int(row["ID"])
+                for _, row in df_all.iterrows()
+            }
+            label = st.selectbox("Selecciona venta a eliminar", list(options.keys()), key="delete_sale_select")
+            sale_id = options[label]
+            reason = st.text_area("Motivo de eliminación", key="delete_sale_reason")
+            confirm = st.checkbox("Confirmo que quiero eliminar esta venta", key="delete_sale_confirm")
+            if st.button("Eliminar venta", width="stretch", type="primary"):
+                if not confirm or not reason.strip():
+                    st.error("Debes confirmar y escribir un motivo.")
+                else:
+                    db = SessionLocal()
+                    try:
+                        s = db.query(Sale).filter(Sale.id == int(sale_id)).first()
+                        if s:
+                            before = {"fecha": s.sale_date, "metros": s.meters, "notas": s.notes}
+                            db.delete(s)
+                            db.commit()
+                            audit_log(user["username"], "Ventas", "eliminar", sale_id, before=before, reason=reason.strip())
+                            st.success("Venta eliminada.")
+                            st.rerun()
+                    finally:
+                        db.close()
 
     st.info(
         f"Con la configuración actual, cada metro se vende en **{format_usd(price)}** "
@@ -690,7 +917,7 @@ def page_load_sale(user):
     df = sales_dataframe()
     if not df.empty:
         st.subheader("Últimos registros")
-        st.dataframe(df.head(15), width="stretch", hide_index=True)
+        st.dataframe(df.head(30), width="stretch", hide_index=True)
 
 
 def page_monthly_report():
@@ -862,43 +1089,127 @@ def page_roi():
 
 
 def page_expenses(user):
-    header("Gastos del equipo", "Registra servicios técnicos, piezas, cabezales, mantenimiento y otros costos deducibles.")
+    header("Gastos del equipo", "Registra, edita o elimina servicios técnicos, piezas, cabezales y otros costos deducibles.")
 
     st.info("Estos gastos se descuentan en el informe mensual antes de calcular ROI y reparto 50/50.")
 
-    with st.form("expense_form"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            expense_date = st.date_input("Fecha del gasto", value=date.today())
-            amount = st.number_input("Monto del gasto ($)", min_value=0.01, step=1.0, format="%.2f")
-        with c2:
-            category = st.selectbox("Categoría", ["Servicio técnico", "Cabezal", "Pieza/Repuesto", "Tinta/consumible especial", "Mantenimiento", "Otro"])
-            paid_by = st.selectbox("Pagado por", ["Empresa", "Rene", "Javier"])
-        with c3:
-            platform = st.text_input("Plataforma / método", placeholder="PayPal, Zelle, efectivo, transferencia...")
-            reference = st.text_input("Referencia", placeholder="Nro. operación, factura, recibo...")
+    tab1, tab2, tab3 = st.tabs(["Registrar gasto", "Editar gasto", "Eliminar gasto"])
 
-        notes = st.text_area("Descripción / notas", placeholder="Ej: cambio de damper, limpieza profunda, compra de cabezal, técnico...")
-        submitted = st.form_submit_button("Guardar gasto", width="stretch")
+    with tab1:
+        with st.form("expense_form"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                expense_date = st.date_input("Fecha del gasto", value=date.today(), key="expense_new_date")
+                amount = st.number_input("Monto del gasto ($)", min_value=0.01, step=1.0, format="%.2f", key="expense_new_amount")
+            with c2:
+                category = st.selectbox("Categoría", ["Servicio técnico", "Cabezal", "Pieza/Repuesto", "Tinta/consumible especial", "Mantenimiento", "Otro"], key="expense_new_category")
+                paid_by = st.selectbox("Pagado por", ["Empresa", "Rene", "Javier"], key="expense_new_paid_by")
+            with c3:
+                platform = st.text_input("Plataforma / método", placeholder="PayPal, Zelle, efectivo, transferencia...", key="expense_new_platform")
+                reference = st.text_input("Referencia", placeholder="Nro. operación, factura, recibo...", key="expense_new_reference")
 
-    if submitted:
-        db = SessionLocal()
-        try:
-            item = Expense(
-                expense_date=expense_date,
-                category=category,
-                amount=float(amount),
-                paid_by=paid_by,
-                platform=platform.strip(),
-                reference=reference.strip(),
-                notes=notes.strip(),
-                created_by=user["username"]
-            )
-            db.add(item)
-            db.commit()
-            st.success("Gasto guardado correctamente.")
-        finally:
-            db.close()
+            notes = st.text_area("Descripción / notas", placeholder="Ej: cambio de damper, limpieza profunda, compra de cabezal, técnico...", key="expense_new_notes")
+            submitted = st.form_submit_button("Guardar gasto", width="stretch")
+
+        if submitted:
+            db = SessionLocal()
+            try:
+                item = Expense(
+                    expense_date=expense_date,
+                    category=category,
+                    amount=float(amount),
+                    paid_by=paid_by,
+                    platform=platform.strip(),
+                    reference=reference.strip(),
+                    notes=notes.strip(),
+                    created_by=user["username"]
+                )
+                db.add(item)
+                db.commit()
+                audit_log(user["username"], "Gastos", "crear", item.id, after={"fecha": expense_date, "categoria": category, "monto": amount, "pagado_por": paid_by})
+                st.success("Gasto guardado correctamente.")
+                st.rerun()
+            finally:
+                db.close()
+
+    df_all = expenses_dataframe()
+
+    with tab2:
+        if df_all.empty:
+            st.info("No hay gastos para editar.")
+        else:
+            options = {
+                f"ID {int(row['ID'])} · {row['Fecha']} · {row['Categoría']} · {format_usd(float(row['Monto']))}": int(row["ID"])
+                for _, row in df_all.iterrows()
+            }
+            label = st.selectbox("Selecciona gasto", list(options.keys()), key="edit_expense_select")
+            expense_id = options[label]
+            exp = get_expense_by_id(expense_id)
+            if exp:
+                with st.form(f"edit_expense_form_{expense_id}"):
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        edit_date = st.date_input("Fecha", value=exp["expense_date"], key=f"expense_edit_date_{expense_id}")
+                        edit_amount = st.number_input("Monto ($)", min_value=0.01, value=exp["amount"], step=1.0, format="%.2f", key=f"expense_edit_amount_{expense_id}")
+                    with c2:
+                        cats = ["Servicio técnico", "Cabezal", "Pieza/Repuesto", "Tinta/consumible especial", "Mantenimiento", "Otro"]
+                        edit_category = st.selectbox("Categoría", cats, index=cats.index(exp["category"]) if exp["category"] in cats else 0, key=f"expense_edit_category_{expense_id}")
+                        payers = ["Empresa", "Rene", "Javier"]
+                        edit_paid_by = st.selectbox("Pagado por", payers, index=payers.index(exp["paid_by"]) if exp["paid_by"] in payers else 0, key=f"expense_edit_paid_by_{expense_id}")
+                    with c3:
+                        edit_platform = st.text_input("Plataforma / método", value=exp["platform"], key=f"expense_edit_platform_{expense_id}")
+                        edit_reference = st.text_input("Referencia", value=exp["reference"], key=f"expense_edit_reference_{expense_id}")
+                    edit_notes = st.text_area("Descripción / notas", value=exp["notes"], key=f"expense_edit_notes_{expense_id}")
+                    save = st.form_submit_button("Guardar cambios", width="stretch")
+                if save:
+                    db = SessionLocal()
+                    try:
+                        e = db.query(Expense).filter(Expense.id == int(expense_id)).first()
+                        before = {"fecha": e.expense_date, "categoria": e.category, "monto": e.amount, "pagado_por": e.paid_by, "referencia": e.reference}
+                        e.expense_date = edit_date
+                        e.category = edit_category
+                        e.amount = float(edit_amount)
+                        e.paid_by = edit_paid_by
+                        e.platform = edit_platform.strip()
+                        e.reference = edit_reference.strip()
+                        e.notes = edit_notes.strip()
+                        db.commit()
+                        audit_log(user["username"], "Gastos", "editar", expense_id, before=before, after={"fecha": edit_date, "categoria": edit_category, "monto": edit_amount, "pagado_por": edit_paid_by, "referencia": edit_reference})
+                        st.success("Gasto actualizado.")
+                        st.rerun()
+                    finally:
+                        db.close()
+
+    with tab3:
+        if user["role"] != "admin":
+            st.warning("Solo un administrador puede eliminar gastos.")
+        elif df_all.empty:
+            st.info("No hay gastos para eliminar.")
+        else:
+            options = {
+                f"ID {int(row['ID'])} · {row['Fecha']} · {row['Categoría']} · {format_usd(float(row['Monto']))}": int(row["ID"])
+                for _, row in df_all.iterrows()
+            }
+            label = st.selectbox("Selecciona gasto a eliminar", list(options.keys()), key="delete_expense_select")
+            expense_id = options[label]
+            reason = st.text_area("Motivo de eliminación", key="delete_expense_reason")
+            confirm = st.checkbox("Confirmo que quiero eliminar este gasto", key="delete_expense_confirm")
+            if st.button("Eliminar gasto", width="stretch", type="primary"):
+                if not confirm or not reason.strip():
+                    st.error("Debes confirmar y escribir un motivo.")
+                else:
+                    db = SessionLocal()
+                    try:
+                        e = db.query(Expense).filter(Expense.id == int(expense_id)).first()
+                        if e:
+                            before = {"fecha": e.expense_date, "categoria": e.category, "monto": e.amount, "pagado_por": e.paid_by, "referencia": e.reference}
+                            db.delete(e)
+                            db.commit()
+                            audit_log(user["username"], "Gastos", "eliminar", expense_id, before=before, reason=reason.strip())
+                            st.success("Gasto eliminado.")
+                            st.rerun()
+                    finally:
+                        db.close()
 
     st.subheader("Historial de gastos")
     df = expenses_dataframe()
@@ -906,159 +1217,6 @@ def page_expenses(user):
         st.info("Todavía no hay gastos registrados.")
     else:
         st.dataframe(df.head(50), width="stretch", hide_index=True)
-
-
-
-def build_javier_account_pdf():
-    """
-    Genera un estado de cuenta PDF de Javier:
-    deuda inicial, cortes cerrados, abonos y saldo pendiente.
-    """
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=letter,
-        rightMargin=36,
-        leftMargin=36,
-        topMargin=36,
-        bottomMargin=36
-    )
-
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "CustomTitle",
-        parent=styles["Title"],
-        fontSize=18,
-        leading=22,
-        textColor=colors.HexColor("#101b3b"),
-        spaceAfter=12
-    )
-    subtitle_style = ParagraphStyle(
-        "CustomSubtitle",
-        parent=styles["Normal"],
-        fontSize=10,
-        leading=14,
-        textColor=colors.HexColor("#4b5563"),
-        spaceAfter=8
-    )
-    section_style = ParagraphStyle(
-        "SectionTitle",
-        parent=styles["Heading2"],
-        fontSize=12,
-        leading=15,
-        textColor=colors.HexColor("#101b3b"),
-        spaceBefore=10,
-        spaceAfter=6
-    )
-
-    story = []
-
-    summary = javier_account_summary()
-    closes = closes_dataframe()
-    payments = payments_dataframe("Javier")
-
-    generated_at = datetime.now().strftime("%d/%m/%Y %I:%M %p")
-
-    story.append(Paragraph("Estado de Cuenta - Javier", title_style))
-    story.append(Paragraph(f"Generado: {generated_at}", subtitle_style))
-    story.append(Paragraph(
-        "Este reporte resume la deuda acumulada inicial, los cortes mensuales cargados, "
-        "los abonos registrados y el saldo pendiente actual con Javier.",
-        subtitle_style
-    ))
-    story.append(Spacer(1, 8))
-
-    summary_data = [
-        ["Concepto", "Monto"],
-        ["Deuda acumulada inicial", format_usd(summary["opening"])],
-        ["Cortes mensuales acumulados", format_usd(summary["monthly_credits"])],
-        ["Abonos pagados", format_usd(summary["payments"])],
-        ["Saldo actual pendiente", format_usd(summary["balance"])],
-    ]
-
-    summary_table = Table(summary_data, colWidths=[3.8 * inch, 2.0 * inch])
-    summary_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#101b3b")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#d1d5db")),
-        ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#f8fafc")),
-        ("FONTNAME", (0, 4), (-1, 4), "Helvetica-Bold"),
-        ("TEXTCOLOR", (0, 4), (-1, 4), colors.HexColor("#b91c1c")),
-        ("ALIGN", (1, 1), (1, -1), "RIGHT"),
-        ("PADDING", (0, 0), (-1, -1), 7),
-    ]))
-    story.append(summary_table)
-    story.append(Spacer(1, 12))
-
-    story.append(Paragraph("Cortes mensuales cargados a Javier", section_style))
-    if closes.empty:
-        story.append(Paragraph("No hay cierres mensuales registrados.", styles["Normal"]))
-    else:
-        closes_data = [["Periodo", "Desde", "Hasta", "Metros", "Javier", "Notas"]]
-        for _, row in closes.iterrows():
-            closes_data.append([
-                str(row["Periodo"]),
-                str(row["Desde"]),
-                str(row["Hasta"]),
-                f"{float(row['Metros']):,.2f}",
-                format_usd(float(row["Abono/cargo Javier"])),
-                str(row["Notas"])[:60],
-            ])
-
-        closes_table = Table(closes_data, colWidths=[0.8*inch, 0.9*inch, 0.9*inch, 0.75*inch, 0.9*inch, 1.7*inch])
-        closes_table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2a42ed")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#d1d5db")),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("ALIGN", (3, 1), (4, -1), "RIGHT"),
-            ("PADDING", (0, 0), (-1, -1), 4),
-        ]))
-        story.append(closes_table)
-
-    story.append(Spacer(1, 12))
-    story.append(Paragraph("Abonos registrados", section_style))
-    if payments.empty:
-        story.append(Paragraph("No hay abonos registrados.", styles["Normal"]))
-    else:
-        payments_data = [["Fecha", "Monto", "Plataforma", "Referencia", "Notas"]]
-        for _, row in payments.iterrows():
-            payments_data.append([
-                str(row["Fecha"]),
-                format_usd(float(row["Monto"])),
-                str(row["Plataforma"]),
-                str(row["Referencia"])[:28],
-                str(row["Notas"])[:65],
-            ])
-
-        payments_table = Table(payments_data, colWidths=[0.95*inch, 0.9*inch, 1.0*inch, 1.35*inch, 1.8*inch])
-        payments_table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#027efc")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#d1d5db")),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("ALIGN", (1, 1), (1, -1), "RIGHT"),
-            ("PADDING", (0, 0), (-1, -1), 4),
-        ]))
-        story.append(payments_table)
-
-    story.append(Spacer(1, 16))
-    story.append(Paragraph(
-        "Nota: Este PDF es un reporte interno generado por el sistema. "
-        "El saldo depende de los cierres mensuales y abonos registrados hasta la fecha de generación.",
-        subtitle_style
-    ))
-
-    doc.build(story)
-    pdf = buffer.getvalue()
-    buffer.close()
-    return pdf
 
 
 def page_javier_account(user):
@@ -1086,6 +1244,26 @@ def page_javier_account(user):
         mime="application/pdf",
         width="stretch"
     )
+
+
+    st.subheader("Estado de cuenta tipo banco")
+    statement_df = build_javier_statement_dataframe()
+    if statement_df.empty:
+        st.info("Todavía no hay movimientos en la cuenta de Javier.")
+    else:
+        show_df = statement_df.copy()
+        for col in ["Debe", "Haber", "Saldo"]:
+            show_df[col] = show_df[col].apply(format_usd)
+        st.dataframe(show_df, width="stretch", hide_index=True)
+
+        csv_statement = statement_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "Descargar movimientos CSV",
+            data=csv_statement,
+            file_name=f"movimientos_javier_{date.today().isoformat()}.csv",
+            mime="text/csv",
+            width="stretch"
+        )
 
 
     tab1, tab2, tab3 = st.tabs(["Registrar abono", "Editar abono", "Eliminar abono"])
@@ -1119,6 +1297,7 @@ def page_javier_account(user):
                 )
                 db.add(p)
                 db.commit()
+                audit_log(user["username"], "Cuenta Javier", "crear abono", p.id, after={"fecha": payment_date, "monto": amount, "plataforma": platform, "referencia": reference})
                 st.success("Abono registrado correctamente.")
                 st.rerun()
             finally:
@@ -1199,12 +1378,14 @@ def page_javier_account(user):
                     try:
                         p = db.query(Payment).filter(Payment.id == int(selected_id)).first()
                         if p:
+                            before = {"fecha": p.payment_date, "monto": p.amount, "plataforma": p.platform, "referencia": p.reference, "notas": p.notes}
                             p.payment_date = edit_date
                             p.amount = float(edit_amount)
                             p.platform = edit_platform
                             p.reference = edit_reference.strip()
                             p.notes = edit_notes.strip()
                             db.commit()
+                            audit_log(user["username"], "Cuenta Javier", "editar abono", selected_id, before=before, after={"fecha": edit_date, "monto": edit_amount, "plataforma": edit_platform, "referencia": edit_reference, "notas": edit_notes})
                             st.success("Abono actualizado correctamente.")
                             st.rerun()
                         else:
@@ -1237,8 +1418,10 @@ def page_javier_account(user):
                     try:
                         p = db.query(Payment).filter(Payment.id == int(delete_id)).first()
                         if p:
+                            before = {"fecha": p.payment_date, "monto": p.amount, "plataforma": p.platform, "referencia": p.reference, "notas": p.notes}
                             db.delete(p)
                             db.commit()
+                            audit_log(user["username"], "Cuenta Javier", "eliminar abono", delete_id, before=before, reason="Eliminado desde Cuenta Javier")
                             st.success("Abono eliminado correctamente.")
                             st.rerun()
                         else:
@@ -1297,6 +1480,15 @@ def page_monthly_close(user):
         f"a la cuenta de Javier como monto pendiente de pago del corte."
     )
 
+    monthly_pdf = build_monthly_close_pdf(period_key, start, end, report, expenses_df, df, javier_account_summary())
+    st.download_button(
+        "Descargar PDF preliminar del cierre",
+        data=monthly_pdf,
+        file_name=f"cierre_mensual_dtf_{period_key}.pdf",
+        mime="application/pdf",
+        width="stretch"
+    )
+
     notes = st.text_area("Notas del cierre", placeholder="Ej: corte mensual revisado con Javier, pendiente abonar por PayPal...")
 
     db = SessionLocal()
@@ -1337,6 +1529,26 @@ def page_monthly_close(user):
             finally:
                 db.close()
 
+
+
+
+def page_audit():
+    header("Auditoría", "Historial de cambios importantes del sistema.")
+
+    st.info("Aquí se registran creaciones, ediciones y eliminaciones de ventas, gastos y abonos.")
+    df = audit_dataframe()
+    if df.empty:
+        st.info("Todavía no hay movimientos de auditoría.")
+    else:
+        st.dataframe(df, width="stretch", hide_index=True)
+        csv = df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "Descargar auditoría CSV",
+            data=csv,
+            file_name=f"auditoria_dtf_{date.today().isoformat()}.csv",
+            mime="text/csv",
+            width="stretch"
+        )
 
 
 def page_users():
@@ -1526,6 +1738,8 @@ def main():
         page_roi()
     elif page == "Cierre mensual" and user["role"] == "admin":
         page_monthly_close(user)
+    elif page == "Auditoría" and user["role"] == "admin":
+        page_audit()
     elif page == "Usuarios" and user["role"] == "admin":
         page_users()
     elif page == "Configuración" and user["role"] == "admin":
