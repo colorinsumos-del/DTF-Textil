@@ -533,6 +533,10 @@ def calculate_report(df: pd.DataFrame, expenses_df: pd.DataFrame = None):
     distributable_profit = net_profit_before_roi - roi_recovery
     partner_share = distributable_profit / 2 if distributable_profit > 0 else 0
 
+    # Javier fue el inversor del equipo, por eso en su cuenta se acumula
+    # su ganancia como socio + la recuperación ROI del equipo.
+    javier_total_with_roi = partner_share + roi_recovery
+
     recovered_total_after = min(recovered_before + roi_recovery, investment) if investment > 0 else 0
     roi_progress = (recovered_total_after / investment * 100) if investment > 0 else 0
 
@@ -546,6 +550,7 @@ def calculate_report(df: pd.DataFrame, expenses_df: pd.DataFrame = None):
         "roi_recovery": roi_recovery,
         "distributable_profit": distributable_profit,
         "partner_share": partner_share,
+        "javier_total_with_roi": javier_total_with_roi,
         "investment": investment,
         "roi_percent": roi_percent,
         "recovered_before": recovered_before,
@@ -1041,7 +1046,7 @@ def page_dashboard():
     with c7:
         metric_card(get_setting("partner_1_name", "Rene"), format_usd(report["partner_share"]))
     with c8:
-        metric_card(get_setting("partner_2_name", "Javier"), format_usd(report["partner_share"]))
+        metric_card(f"{get_setting('partner_2_name', 'Javier')} + ROI", format_usd(report["javier_total_with_roi"]))
 
     st.subheader("Progreso de recuperación del equipo")
     investment = report["investment"]
@@ -1217,13 +1222,15 @@ def page_monthly_report():
     with c5:
         metric_card("Utilidad real antes ROI", format_usd(report["net_profit_before_roi"]))
 
-    c6, c7, c8 = st.columns(3)
+    c6, c7, c8, c9 = st.columns(4)
     with c6:
         metric_card(f"ROI equipo ({report['roi_percent']:.2f}%)", format_usd(report["roi_recovery"]))
     with c7:
         metric_card(get_setting("partner_1_name", "Rene"), format_usd(report["partner_share"]))
     with c8:
-        metric_card(get_setting("partner_2_name", "Javier"), format_usd(report["partner_share"]))
+        metric_card(f"{get_setting('partner_2_name', 'Javier')} ganancia", format_usd(report["partner_share"]))
+    with c9:
+        metric_card("Total Javier + ROI", format_usd(report["javier_total_with_roi"]))
 
     st.markdown("### Fórmula aplicada")
     st.code(
@@ -1248,6 +1255,9 @@ Utilidad a repartir = {report['distributable_profit']:.2f}
 
 Cada socio = utilidad a repartir / 2
 Cada socio = {report['partner_share']:.2f}
+
+Total a pagar a Javier = ganancia Javier + ROI equipo
+Total a pagar a Javier = {report['partner_share']:.2f} + {report['roi_recovery']:.2f} = {report['javier_total_with_roi']:.2f}
         """.strip(),
         language="text"
     )
@@ -1957,7 +1967,7 @@ def build_monthly_close_pdf(period_key, start, end, report, expenses_df, sales_d
     partner_2 = get_setting("partner_2_name", "Javier")
 
     saldo_javier_antes = float(account_summary.get("balance", 0) or 0)
-    monto_javier = float(report.get("partner_share", 0) or 0)
+    monto_javier = float(report.get("javier_total_with_roi", report.get("partner_share", 0)) or 0)
     saldo_javier_despues = saldo_javier_antes + monto_javier
 
     summary_data = [
@@ -1970,7 +1980,9 @@ def build_monthly_close_pdf(period_key, start, end, report, expenses_df, sales_d
         [f"ROI equipo ({float(report.get('roi_percent', 0) or 0):.2f}%)", format_usd(float(report.get("roi_recovery", 0) or 0))],
         ["Utilidad a repartir", format_usd(float(report.get("distributable_profit", 0) or 0))],
         [partner_1, format_usd(float(report.get("partner_share", 0) or 0))],
-        [partner_2, format_usd(float(report.get("partner_share", 0) or 0))],
+        [f"{partner_2} ganancia", format_usd(float(report.get("partner_share", 0) or 0))],
+        ["ROI equipo para Javier", format_usd(float(report.get("roi_recovery", 0) or 0))],
+        ["Total a pagar a Javier", format_usd(monto_javier)],
         ["Saldo Javier antes del cierre", format_usd(saldo_javier_antes)],
         ["Saldo Javier estimado después del cierre", format_usd(saldo_javier_despues)],
     ]
@@ -1984,7 +1996,7 @@ def build_monthly_close_pdf(period_key, start, end, report, expenses_df, sales_d
         ("FONTSIZE", (0, 0), (-1, -1), 8.3),
         ("ALIGN", (1, 1), (1, -1), "RIGHT"),
         ("PADDING", (0, 0), (-1, -1), 5.5),
-        ("FONTNAME", (0, 10), (-1, 11), "Helvetica-Bold"),
+        ("FONTNAME", (0, 10), (-1, 13), "Helvetica-Bold"),
     ]))
     story.append(summary_table)
 
@@ -2056,7 +2068,7 @@ def build_monthly_close_pdf(period_key, start, end, report, expenses_df, sales_d
     story.append(Spacer(1, 14))
     story.append(Paragraph(
         "Nota: Este PDF es preliminar si el mes aún no ha sido cerrado. "
-        "Al cerrar el mes, el monto correspondiente a Javier se carga en su cuenta.",
+        "Al cerrar el mes, se carga en la cuenta de Javier su ganancia más el ROI del equipo.",
         small_style
     ))
 
@@ -2088,7 +2100,7 @@ def page_monthly_close(user):
     report = calculate_report(df, expenses_df)
 
     st.subheader(f"Previsualización del cierre {period_key}")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         metric_card("Metros", f"{report['total_meters']:,.2f} m")
     with c2:
@@ -2096,11 +2108,14 @@ def page_monthly_close(user):
     with c3:
         metric_card("Gastos deducibles", format_usd(report["deductible_expenses"]))
     with c4:
-        metric_card("Le toca a Javier", format_usd(report["partner_share"]))
+        metric_card("Ganancia Javier", format_usd(report["partner_share"]))
+    with c5:
+        metric_card("Javier + ROI", format_usd(report["javier_total_with_roi"]))
 
-    st.write(
-        f"Al cerrar este mes, se sumará **{format_usd(report['partner_share'])}** "
-        f"a la cuenta de Javier como monto pendiente de pago del corte."
+    st.info(
+        f"Al cerrar este mes, se sumará **{format_usd(report['javier_total_with_roi'])}** "
+        f"a la cuenta de Javier: **{format_usd(report['partner_share'])}** de ganancia + "
+        f"**{format_usd(report['roi_recovery'])}** de ROI del equipo."
     )
 
     try:
@@ -2141,14 +2156,14 @@ def page_monthly_close(user):
                     roi_recovery=report["roi_recovery"],
                     distributable_profit=report["distributable_profit"],
                     partner_share=report["partner_share"],
-                    javier_credit=report["partner_share"],
+                    javier_credit=report["javier_total_with_roi"],
                     rene_credit=report["partner_share"],
                     notes=notes.strip(),
                     created_by=user["username"]
                 )
                 db.add(close)
                 db.commit()
-                st.success("Cierre mensual guardado y monto cargado a la cuenta de Javier.")
+                st.success("Cierre mensual guardado. Se cargó a Javier su ganancia más el ROI del equipo.")
             except IntegrityError:
                 db.rollback()
                 st.error("Este periodo ya fue cerrado.")
