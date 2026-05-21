@@ -1630,6 +1630,179 @@ def page_javier_account(user):
         st.dataframe(payments, width="stretch", hide_index=True)
 
 
+
+def build_monthly_close_pdf(period_key, start, end, report, expenses_df, sales_df, account_summary):
+    """
+    Genera un PDF estable del cierre mensual.
+    Incluye ventas, costos, gastos, ROI, socios y saldo estimado de Javier.
+    """
+    buffer = BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=36,
+    )
+
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        "MonthlyCloseTitle",
+        parent=styles["Title"],
+        fontSize=18,
+        leading=22,
+        textColor=colors.HexColor("#101b3b"),
+        spaceAfter=10,
+    )
+
+    section_style = ParagraphStyle(
+        "MonthlyCloseSection",
+        parent=styles["Heading2"],
+        fontSize=12,
+        leading=15,
+        textColor=colors.HexColor("#101b3b"),
+        spaceBefore=10,
+        spaceAfter=6,
+    )
+
+    small_style = ParagraphStyle(
+        "MonthlyCloseSmall",
+        parent=styles["Normal"],
+        fontSize=8,
+        leading=11,
+        textColor=colors.HexColor("#4b5563"),
+    )
+
+    story = []
+
+    story.append(Paragraph(f"Reporte de Cierre Mensual DTF - {period_key}", title_style))
+    story.append(Paragraph(
+        f"Periodo: {start} a {end} · Generado: {datetime.now().strftime('%d/%m/%Y %I:%M %p')}",
+        small_style
+    ))
+    story.append(Paragraph(
+        "Reporte interno para control de metros vendidos, utilidad, ROI, gastos y reparto entre socios.",
+        small_style
+    ))
+    story.append(Spacer(1, 10))
+
+    partner_1 = get_setting("partner_1_name", "Rene")
+    partner_2 = get_setting("partner_2_name", "Javier")
+
+    saldo_javier_antes = float(account_summary.get("balance", 0) or 0)
+    monto_javier = float(report.get("partner_share", 0) or 0)
+    saldo_javier_despues = saldo_javier_antes + monto_javier
+
+    summary_data = [
+        ["Concepto", "Monto"],
+        ["Metros vendidos", f"{float(report.get('total_meters', 0) or 0):,.2f} m"],
+        ["Venta bruta", format_usd(float(report.get("revenue", 0) or 0))],
+        ["Costo producción", format_usd(float(report.get("production_cost", 0) or 0))],
+        ["Gastos deducibles", format_usd(float(report.get("deductible_expenses", 0) or 0))],
+        ["Utilidad real antes ROI", format_usd(float(report.get("net_profit_before_roi", 0) or 0))],
+        [f"ROI equipo ({float(report.get('roi_percent', 0) or 0):.2f}%)", format_usd(float(report.get("roi_recovery", 0) or 0))],
+        ["Utilidad a repartir", format_usd(float(report.get("distributable_profit", 0) or 0))],
+        [partner_1, format_usd(float(report.get("partner_share", 0) or 0))],
+        [partner_2, format_usd(float(report.get("partner_share", 0) or 0))],
+        ["Saldo Javier antes del cierre", format_usd(saldo_javier_antes)],
+        ["Saldo Javier estimado después del cierre", format_usd(saldo_javier_despues)],
+    ]
+
+    summary_table = Table(summary_data, colWidths=[3.7 * inch, 2.0 * inch])
+    summary_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#101b3b")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#d1d5db")),
+        ("FONTSIZE", (0, 0), (-1, -1), 8.3),
+        ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+        ("PADDING", (0, 0), (-1, -1), 5.5),
+        ("FONTNAME", (0, 10), (-1, 11), "Helvetica-Bold"),
+    ]))
+    story.append(summary_table)
+
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("Resumen diario de ventas", section_style))
+
+    if sales_df is None or sales_df.empty:
+        story.append(Paragraph("No se registraron ventas en este periodo.", small_style))
+    else:
+        df_sales = sales_df.copy()
+        df_sales["Fecha"] = pd.to_datetime(df_sales["Fecha"])
+        daily = df_sales.groupby("Fecha", as_index=False)["Metros"].sum()
+
+        data = [["Fecha", "Metros", "Venta bruta", "Costo", "Utilidad bruta"]]
+        price = float(report.get("price", 6) or 6)
+        cost = float(report.get("cost", 2) or 2)
+
+        for _, row in daily.iterrows():
+            meters = float(row.get("Metros", 0) or 0)
+            data.append([
+                row["Fecha"].strftime("%Y-%m-%d"),
+                f"{meters:,.2f}",
+                format_usd(meters * price),
+                format_usd(meters * cost),
+                format_usd(meters * (price - cost)),
+            ])
+
+        table = Table(data, colWidths=[1.05*inch, 0.75*inch, 1.05*inch, 1.0*inch, 1.15*inch])
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2a42ed")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d1d5db")),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.1),
+            ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+            ("PADDING", (0, 0), (-1, -1), 3.5),
+        ]))
+        story.append(table)
+
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("Gastos deducibles del periodo", section_style))
+
+    if expenses_df is None or expenses_df.empty:
+        story.append(Paragraph("No se registraron gastos deducibles en este periodo.", small_style))
+    else:
+        data = [["Fecha", "Categoría", "Monto", "Pagado por", "Referencia"]]
+
+        for _, row in expenses_df.iterrows():
+            data.append([
+                str(row.get("Fecha", ""))[:12],
+                str(row.get("Categoría", ""))[:24],
+                format_usd(float(row.get("Monto", 0) or 0)),
+                str(row.get("Pagado por", ""))[:12],
+                str(row.get("Referencia", ""))[:22],
+            ])
+
+        table = Table(data, colWidths=[0.85*inch, 1.65*inch, 0.8*inch, 0.95*inch, 1.35*inch])
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#027efc")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d1d5db")),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.1),
+            ("ALIGN", (2, 1), (2, -1), "RIGHT"),
+            ("PADDING", (0, 0), (-1, -1), 3.5),
+        ]))
+        story.append(table)
+
+    story.append(Spacer(1, 14))
+    story.append(Paragraph(
+        "Nota: Este PDF es preliminar si el mes aún no ha sido cerrado. "
+        "Al cerrar el mes, el monto correspondiente a Javier se carga en su cuenta.",
+        small_style
+    ))
+
+    doc.build(story)
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+
+
+
 def page_monthly_close(user):
     header("Cierre mensual", "Cierra un mes y carga automáticamente el monto correspondiente a la cuenta de Javier.")
 
@@ -1666,14 +1839,17 @@ def page_monthly_close(user):
         f"a la cuenta de Javier como monto pendiente de pago del corte."
     )
 
-    monthly_pdf = build_monthly_close_pdf(period_key, start, end, report, expenses_df, df, javier_account_summary())
-    st.download_button(
-        "Descargar PDF preliminar del cierre",
-        data=monthly_pdf,
-        file_name=f"cierre_mensual_dtf_{period_key}.pdf",
-        mime="application/pdf",
-        width="stretch"
-    )
+    try:
+        monthly_pdf = build_monthly_close_pdf(period_key, start, end, report, expenses_df, df, javier_account_summary())
+        st.download_button(
+            "Descargar PDF preliminar del cierre",
+            data=monthly_pdf,
+            file_name=f"cierre_mensual_dtf_{period_key}.pdf",
+            mime="application/pdf",
+            width="stretch"
+        )
+    except Exception as e:
+        st.warning(f"No se pudo generar el PDF preliminar del cierre: {e}")
 
     notes = st.text_area("Notas del cierre", placeholder="Ej: corte mensual revisado con Javier, pendiente abonar por PayPal...")
 
