@@ -714,7 +714,7 @@ def page_monthly_report():
     report = calculate_report(df, expenses_df)
 
     st.subheader("Resumen del corte")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         metric_card("Metros vendidos", f"{report['total_meters']:,.2f} m")
     with c2:
@@ -722,10 +722,12 @@ def page_monthly_report():
     with c3:
         metric_card("Costo producción", format_usd(report["production_cost"]))
     with c4:
-        metric_card("Utilidad bruta", format_usd(report["gross_profit"]))
-
-    c5, c6, c7 = st.columns(3)
+        metric_card("Gastos deducibles", format_usd(report["deductible_expenses"]))
     with c5:
+        metric_card("Utilidad real antes ROI", format_usd(report["net_profit_before_roi"]))
+
+    c6, c7, c8 = st.columns(3)
+    with c6:
         metric_card(f"ROI equipo ({report['roi_percent']:.2f}%)", format_usd(report["roi_recovery"]))
     with c7:
         metric_card(get_setting("partner_1_name", "Rene"), format_usd(report["partner_share"]))
