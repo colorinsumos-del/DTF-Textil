@@ -1236,14 +1236,17 @@ def page_javier_account(user):
 
     st.caption("Saldo actual = deuda inicial + cortes cerrados que le corresponden a Javier - abonos pagados.")
 
-    pdf_bytes = build_javier_account_pdf()
-    st.download_button(
-        "Descargar estado de cuenta PDF",
-        data=pdf_bytes,
-        file_name=f"estado_cuenta_javier_{date.today().isoformat()}.pdf",
-        mime="application/pdf",
-        width="stretch"
-    )
+    try:
+        pdf_bytes = build_javier_account_pdf()
+        st.download_button(
+            "Descargar estado de cuenta PDF",
+            data=pdf_bytes,
+            file_name=f"estado_cuenta_javier_{date.today().isoformat()}.pdf",
+            mime="application/pdf",
+            width="stretch"
+        )
+    except Exception as e:
+        st.warning(f"No se pudo generar el PDF de Cuenta Javier en este momento: {e}")
 
 
     st.subheader("Estado de cuenta tipo banco")
