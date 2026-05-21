@@ -1219,6 +1219,189 @@ def page_expenses(user):
         st.dataframe(df.head(50), width="stretch", hide_index=True)
 
 
+
+def build_javier_account_pdf():
+    """
+    Genera un PDF simple y estable del estado de cuenta de Javier.
+    Incluye resumen, estado tipo banco, cortes mensuales y abonos.
+    """
+    buffer = BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=36,
+    )
+
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        "JavierPDFTitle",
+        parent=styles["Title"],
+        fontSize=18,
+        leading=22,
+        textColor=colors.HexColor("#101b3b"),
+        spaceAfter=10,
+    )
+
+    section_style = ParagraphStyle(
+        "JavierPDFSection",
+        parent=styles["Heading2"],
+        fontSize=12,
+        leading=15,
+        textColor=colors.HexColor("#101b3b"),
+        spaceBefore=10,
+        spaceAfter=6,
+    )
+
+    small_style = ParagraphStyle(
+        "JavierPDFSmall",
+        parent=styles["Normal"],
+        fontSize=8,
+        leading=11,
+        textColor=colors.HexColor("#4b5563"),
+    )
+
+    story = []
+
+    summary = javier_account_summary()
+    statement = build_javier_statement_dataframe()
+    closes = closes_dataframe()
+    payments = payments_dataframe("Javier")
+
+    story.append(Paragraph("Estado de Cuenta - Javier", title_style))
+    story.append(Paragraph(f"Generado: {datetime.now().strftime('%d/%m/%Y %I:%M %p')}", small_style))
+    story.append(Paragraph(
+        "Reporte interno de deuda acumulada, cortes mensuales, abonos y saldo pendiente.",
+        small_style
+    ))
+    story.append(Spacer(1, 10))
+
+    summary_data = [
+        ["Concepto", "Monto"],
+        ["Deuda acumulada inicial", format_usd(summary.get("opening", 0))],
+        ["Cortes mensuales acumulados", format_usd(summary.get("monthly_credits", 0))],
+        ["Abonos pagados", format_usd(summary.get("payments", 0))],
+        ["Saldo actual pendiente", format_usd(summary.get("balance", 0))],
+    ]
+
+    summary_table = Table(summary_data, colWidths=[3.6 * inch, 2.0 * inch])
+    summary_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#101b3b")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#d1d5db")),
+        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+        ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+        ("PADDING", (0, 0), (-1, -1), 6),
+        ("FONTNAME", (0, 4), (-1, 4), "Helvetica-Bold"),
+        ("TEXTCOLOR", (0, 4), (-1, 4), colors.HexColor("#b91c1c")),
+    ]))
+    story.append(summary_table)
+
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("Estado de cuenta tipo banco", section_style))
+
+    if statement.empty:
+        story.append(Paragraph("No hay movimientos registrados.", small_style))
+    else:
+        data = [["Fecha", "Concepto", "Debe", "Haber", "Saldo", "Referencia"]]
+        for _, row in statement.iterrows():
+            data.append([
+                str(row.get("Fecha", ""))[:12],
+                str(row.get("Concepto", ""))[:30],
+                format_usd(float(row.get("Debe", 0) or 0)),
+                format_usd(float(row.get("Haber", 0) or 0)),
+                format_usd(float(row.get("Saldo", 0) or 0)),
+                str(row.get("Referencia", ""))[:18],
+            ])
+
+        table = Table(data, colWidths=[0.75*inch, 1.75*inch, 0.75*inch, 0.75*inch, 0.85*inch, 1.0*inch])
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2a42ed")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d1d5db")),
+            ("FONTSIZE", (0, 0), (-1, -1), 6.8),
+            ("ALIGN", (2, 1), (4, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("PADDING", (0, 0), (-1, -1), 3),
+        ]))
+        story.append(table)
+
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("Cortes mensuales cargados", section_style))
+
+    if closes.empty:
+        story.append(Paragraph("No hay cierres mensuales registrados.", small_style))
+    else:
+        data = [["Periodo", "Desde", "Hasta", "Metros", "Monto Javier"]]
+        for _, row in closes.iterrows():
+            data.append([
+                str(row.get("Periodo", "")),
+                str(row.get("Desde", "")),
+                str(row.get("Hasta", "")),
+                f"{float(row.get('Metros', 0) or 0):,.2f}",
+                format_usd(float(row.get("Abono/cargo Javier", 0) or 0)),
+            ])
+
+        table = Table(data, colWidths=[0.85*inch, 1.0*inch, 1.0*inch, 0.85*inch, 1.1*inch])
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#027efc")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d1d5db")),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.2),
+            ("ALIGN", (3, 1), (4, -1), "RIGHT"),
+            ("PADDING", (0, 0), (-1, -1), 3.5),
+        ]))
+        story.append(table)
+
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("Abonos registrados", section_style))
+
+    if payments.empty:
+        story.append(Paragraph("No hay abonos registrados.", small_style))
+    else:
+        data = [["Fecha", "Monto", "Plataforma", "Referencia", "Notas"]]
+        for _, row in payments.iterrows():
+            data.append([
+                str(row.get("Fecha", "")),
+                format_usd(float(row.get("Monto", 0) or 0)),
+                str(row.get("Plataforma", ""))[:14],
+                str(row.get("Referencia", ""))[:22],
+                str(row.get("Notas", ""))[:34],
+            ])
+
+        table = Table(data, colWidths=[0.85*inch, 0.85*inch, 0.95*inch, 1.25*inch, 1.65*inch])
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#101b3b")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d1d5db")),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.0),
+            ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("PADDING", (0, 0), (-1, -1), 3.5),
+        ]))
+        story.append(table)
+
+    story.append(Spacer(1, 14))
+    story.append(Paragraph(
+        "Nota: Este PDF es un reporte interno. El saldo depende de los cierres y abonos registrados hasta la fecha de generación.",
+        small_style
+    ))
+
+    doc.build(story)
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+
+
+
 def page_javier_account(user):
     header("Cuenta Javier", "Control de deuda acumulada, abonos realizados y cortes mensuales pendientes.")
 
@@ -1246,7 +1429,7 @@ def page_javier_account(user):
             width="stretch"
         )
     except Exception as e:
-        st.warning(f"No se pudo generar el PDF de Cuenta Javier en este momento: {e}")
+        st.error(f"No se pudo generar el PDF de Cuenta Javier: {e}")
 
 
     st.subheader("Estado de cuenta tipo banco")
