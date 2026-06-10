@@ -207,25 +207,72 @@ def init_db():
             )
             db.add(admin)
 
-        defaults = {
-            "price_per_meter": "6.00",
-            "cost_per_meter": "2.00",
-            "equipment_investment": "0.00",
-            "roi_recovery_percent": "20.00",
-            "partner_1_name": "Rene",
-            "partner_2_name": "Javier",
-            "opening_debt_javier": "0.00",
-            "opening_debt_notes": "Deuda acumulada previa al sistema.",
-        }
-
-        for key, value in defaults.items():
-            if not db.query(Setting).filter(Setting.key == key).first():
-                db.add(Setting(key=key, value=value))
+        ensure_default_settings_and_migrations(db)
 
         db.commit()
     finally:
         db.close()
 
+
+
+def ensure_default_settings_and_migrations(db):
+    """
+    Crea configuraciones faltantes y corrige valores heredados de versiones anteriores.
+
+    Importante:
+    - El costo por metro oficial queda en $2.00.
+    - Algunas versiones viejas traían $1.80; si todavía existe ese valor heredado,
+      se migra una sola vez a $2.00 para que al reiniciar no vuelva al costo viejo.
+    - El ROI del equipo pertenece a Javier, porque él fue el inversor.
+    """
+    defaults = {
+        "price_per_meter": "6.00",
+        "cost_per_meter": "2.00",
+        "equipment_investment": "0.00",
+        "roi_recovery_percent": "20.00",
+        "partner_1_name": "Rene",
+        "partner_2_name": "Javier",
+        "opening_debt_javier": "0.00",
+        "opening_debt_notes": "Deuda acumulada previa al sistema.",
+        "migration_cost_per_meter_2_default_done": "0",
+    }
+
+    for key, value in defaults.items():
+        if not db.query(Setting).filter(Setting.key == key).first():
+            db.add(Setting(key=key, value=value))
+
+    db.flush()
+
+    migration_flag = db.query(Setting).filter(Setting.key == "migration_cost_per_meter_2_default_done").first()
+    cost_setting = db.query(Setting).filter(Setting.key == "cost_per_meter").first()
+    try:
+        current_cost = float(cost_setting.value) if cost_setting else 2.0
+    except Exception:
+        current_cost = 2.0
+
+    # Si viene de una BD/backup viejo con 1.80, actualiza al costo correcto de $2.00.
+    if migration_flag and migration_flag.value != "1" and abs(current_cost - 1.80) < 0.00001:
+        cost_setting.value = "2.00"
+        migration_flag.value = "1"
+
+    # Reparación de cierres hechos con versiones anteriores:
+    # si el cierre tenía ROI separado pero el cargo de Javier quedó solo con su ganancia,
+    # se corrige a ganancia de Javier + ROI del equipo. Rene queda solo con su 50%.
+    for close in db.query(MonthlyClose).all():
+        partner_share = float(close.partner_share or 0)
+        roi_recovery = float(close.roi_recovery or 0)
+        javier_credit = float(close.javier_credit or 0)
+        if roi_recovery > 0 and abs(javier_credit - partner_share) < 0.00001:
+            close.javier_credit = partner_share + roi_recovery
+            close.rene_credit = partner_share
+
+
+def set_setting_in_session(db, key: str, value: str):
+    item = db.query(Setting).filter(Setting.key == key).first()
+    if item:
+        item.value = str(value)
+    else:
+        db.add(Setting(key=key, value=str(value)))
 
 def get_setting(key: str, default: str = "") -> str:
     db = SessionLocal()
@@ -239,11 +286,9 @@ def get_setting(key: str, default: str = "") -> str:
 def set_setting(key: str, value: str):
     db = SessionLocal()
     try:
-        item = db.query(Setting).filter(Setting.key == key).first()
-        if item:
-            item.value = str(value)
-        else:
-            db.add(Setting(key=key, value=str(value)))
+        set_setting_in_session(db, key, value)
+        if key == "cost_per_meter":
+            set_setting_in_session(db, "migration_cost_per_meter_2_default_done", "1")
         db.commit()
     finally:
         db.close()
@@ -959,6 +1004,7 @@ def import_database_backup(uploaded_bytes, mode="replace"):
                 reason=row.get("reason", "") or "",
             ))
 
+        ensure_default_settings_and_migrations(db)
         db.commit()
 
         # En SQLite, actualiza secuencias si existen; en PostgreSQL los IDs explícitos suelen funcionar
@@ -1320,9 +1366,10 @@ def page_roi():
         total_meters = float(df_all["Metros"].sum())
         total_profit = total_meters * (price - cost)
 
-    recovered = 0
-    if investment > 0:
-        recovered = min(total_profit * (roi_percent / 100.0), investment)
+    # El ROI recuperado oficial sale de cierres mensuales, porque allí se carga
+    # como parte del saldo de Javier. Esto evita mostrar ROI como si fuera de Rene
+    # o duplicar ventas aún no cerradas.
+    recovered = get_recovered_total_from_closed_months() if investment > 0 else 0
 
     remaining = max(investment - recovered, 0)
     progress = recovered / investment * 100 if investment > 0 else 0
@@ -1331,9 +1378,9 @@ def page_roi():
     with c1:
         metric_card("Inversión equipo", format_usd(investment))
     with c2:
-        metric_card("Recuperado estimado", format_usd(recovered))
+        metric_card("ROI recuperado Javier", format_usd(recovered))
     with c3:
-        metric_card("Pendiente por recuperar", format_usd(remaining))
+        metric_card("Pendiente ROI Javier", format_usd(remaining))
     with c4:
         metric_card("Avance ROI", f"{progress:.2f}%")
 
@@ -1356,7 +1403,7 @@ def page_roi():
     st.info(
         f"Con **{avg_daily_meters:.2f} m diarios** durante **{working_days} días**, "
         f"la utilidad estimada mensual sería **{format_usd(monthly_profit)}**. "
-        f"El apartado mensual para ROI sería **{format_usd(monthly_roi)}**. "
+        f"El apartado mensual para ROI de Javier sería **{format_usd(monthly_roi)}**. "
         f"Tiempo estimado para recuperar lo pendiente: **{months_to_recover:.2f} meses**."
     )
 
@@ -2403,15 +2450,21 @@ def page_settings():
 
         submitted = st.form_submit_button("Guardar configuración", width="stretch")
 
+    st.caption(
+        f"Costo por metro guardado actualmente: {format_usd(get_money_setting('cost_per_meter', 2.0))}. "
+        "El ROI recuperado se carga en la cuenta de Javier, no en la de Rene."
+    )
+
     if submitted:
-        set_setting("price_per_meter", price)
-        set_setting("cost_per_meter", cost)
-        set_setting("equipment_investment", investment)
-        set_setting("roi_recovery_percent", roi_percent)
+        set_setting("price_per_meter", f"{float(price):.2f}")
+        set_setting("cost_per_meter", f"{float(cost):.2f}")
+        set_setting("equipment_investment", f"{float(investment):.2f}")
+        set_setting("roi_recovery_percent", f"{float(roi_percent):.2f}")
         set_setting("partner_1_name", partner_1.strip() or "Rene")
         set_setting("partner_2_name", partner_2.strip() or "Javier")
-        set_setting("opening_debt_javier", opening_debt)
-        st.success("Configuración guardada.")
+        set_setting("opening_debt_javier", f"{float(opening_debt):.2f}")
+        saved_cost = get_money_setting("cost_per_meter", 2.0)
+        st.success(f"Configuración guardada. Costo por metro activo: {format_usd(saved_cost)}.")
 
 
 def page_database():
