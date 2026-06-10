@@ -42,7 +42,7 @@ st.set_page_config(
 APP_NAME = "DTF Control ROI"
 DEFAULT_ADMIN_USER = "admin"
 DEFAULT_ADMIN_PASS = "admin123"
-APP_VERSION = "Fix16 - Reconversión sin cerrar mes actual"
+APP_VERSION = "Fix17 - ROI Javier fijo"
 
 Base = declarative_base()
 
@@ -244,6 +244,17 @@ def ensure_default_settings_and_migrations(db):
             db.add(Setting(key=key, value=value))
 
     db.flush()
+
+    # Reparación de nombres heredados: algunas versiones permitían invertir
+    # Socio 1/Socio 2 y eso podía mostrar en Dashboard "Rene + ROI".
+    # En este negocio el ROI del equipo SIEMPRE pertenece a Javier.
+    partner_1_setting = db.query(Setting).filter(Setting.key == "partner_1_name").first()
+    partner_2_setting = db.query(Setting).filter(Setting.key == "partner_2_name").first()
+    p1 = (partner_1_setting.value if partner_1_setting else "").strip().lower()
+    p2 = (partner_2_setting.value if partner_2_setting else "").strip().lower()
+    if partner_1_setting and partner_2_setting and p1 == "javier" and p2 in {"rene", "rené"}:
+        partner_1_setting.value = "Rene"
+        partner_2_setting.value = "Javier"
 
     migration_flag = db.query(Setting).filter(Setting.key == "migration_cost_per_meter_2_default_done").first()
     cost_setting = db.query(Setting).filter(Setting.key == "cost_per_meter").first()
@@ -1247,9 +1258,9 @@ def page_dashboard():
     with c6:
         metric_card("Apartado ROI del corte", format_usd(report["roi_recovery"]))
     with c7:
-        metric_card(get_setting("partner_1_name", "Rene"), format_usd(report["partner_share"]))
+        metric_card("Rene", format_usd(report["partner_share"]))
     with c8:
-        metric_card(f"{get_setting('partner_2_name', 'Javier')} + ROI", format_usd(report["javier_total_with_roi"]))
+        metric_card("Javier + ROI", format_usd(report["javier_total_with_roi"]))
 
     st.subheader("Progreso de recuperación del equipo")
     investment = report["investment"]
@@ -1429,9 +1440,9 @@ def page_monthly_report():
     with c6:
         metric_card(f"ROI equipo ({report['roi_percent']:.2f}%)", format_usd(report["roi_recovery"]))
     with c7:
-        metric_card(get_setting("partner_1_name", "Rene"), format_usd(report["partner_share"]))
+        metric_card("Rene", format_usd(report["partner_share"]))
     with c8:
-        metric_card(f"{get_setting('partner_2_name', 'Javier')} ganancia", format_usd(report["partner_share"]))
+        metric_card("Javier ganancia", format_usd(report["partner_share"]))
     with c9:
         metric_card("Total Javier + ROI", format_usd(report["javier_total_with_roi"]))
 
@@ -2167,8 +2178,8 @@ def build_monthly_close_pdf(period_key, start, end, report, expenses_df, sales_d
     ))
     story.append(Spacer(1, 10))
 
-    partner_1 = get_setting("partner_1_name", "Rene")
-    partner_2 = get_setting("partner_2_name", "Javier")
+    partner_1 = "Rene"
+    partner_2 = "Javier"
 
     saldo_javier_antes = float(account_summary.get("balance", 0) or 0)
     monto_javier = float(report.get("javier_total_with_roi", report.get("partner_share", 0)) or 0)
@@ -2729,8 +2740,7 @@ def page_settings():
                 value=get_money_setting("roi_recovery_percent", 20.0),
                 step=1.0
             )
-            partner_1 = st.text_input("Nombre socio 1", value=get_setting("partner_1_name", "Rene"))
-            partner_2 = st.text_input("Nombre socio 2", value=get_setting("partner_2_name", "Javier"))
+            st.info("Socios fijos para el reparto: Rene recibe solo su ganancia. Javier recibe su ganancia + ROI del equipo.")
             opening_debt = st.number_input("Deuda acumulada inicial con Javier ($)", min_value=0.0, value=get_money_setting("opening_debt_javier", 0.0), step=10.0)
 
         submitted = st.form_submit_button("Guardar configuración", width="stretch")
@@ -2745,8 +2755,9 @@ def page_settings():
         set_setting("cost_per_meter", f"{float(cost):.2f}")
         set_setting("equipment_investment", f"{float(investment):.2f}")
         set_setting("roi_recovery_percent", f"{float(roi_percent):.2f}")
-        set_setting("partner_1_name", partner_1.strip() or "Rene")
-        set_setting("partner_2_name", partner_2.strip() or "Javier")
+        # Mantener nombres fijos para evitar que el ROI aparezca asociado a Rene.
+        set_setting("partner_1_name", "Rene")
+        set_setting("partner_2_name", "Javier")
         set_setting("opening_debt_javier", f"{float(opening_debt):.2f}")
         saved_cost = get_money_setting("cost_per_meter", 2.0)
         st.success(f"Configuración guardada. Costo por metro activo: {format_usd(saved_cost)}.")
