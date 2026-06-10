@@ -42,7 +42,7 @@ st.set_page_config(
 APP_NAME = "DTF Control ROI"
 DEFAULT_ADMIN_USER = "admin"
 DEFAULT_ADMIN_PASS = "admin123"
-APP_VERSION = "Fix15 - Reconversión visible"
+APP_VERSION = "Fix16 - Reconversión sin cerrar mes actual"
 
 Base = declarative_base()
 
@@ -618,6 +618,11 @@ def month_bounds(year: int, month: int):
     return date(int(year), int(month), 1), date(int(year), int(month), last_day)
 
 
+def current_period_key():
+    today = date.today()
+    return f"{today.year:04d}-{today.month:02d}"
+
+
 def get_all_activity_periods():
     """
     Devuelve todos los meses que tienen ventas, gastos o cierres existentes.
@@ -661,8 +666,10 @@ def build_reconversion_preview():
         expenses_df = expenses_dataframe(start, end)
         report = calculate_report(df, expenses_df, recovered_before_override=recovered_before)
         recovered_before = min(recovered_before + float(report["roi_recovery"]), investment) if investment > 0 else 0.0
+        is_current = period_key == current_period_key()
         rows.append({
             "Periodo": period_key,
+            "Estado reconversión": "Mes actual: solo vista previa, NO se cerrará" if is_current else "Se recalculará como cierre histórico",
             "Desde": start,
             "Hasta": end,
             "Metros": report["total_meters"],
@@ -687,13 +694,19 @@ def apply_total_reconversion(username: str, reason: str = ""):
     Conserva intactos los abonos/pagos hechos a Javier.
     """
     preview = build_reconversion_preview()
+    current_key = current_period_key()
+    closes_to_write = preview[preview["Periodo"].astype(str) != current_key].copy() if not preview.empty else preview
     db = SessionLocal()
     try:
         before_closes = closes_dataframe().to_dict("records")
+        # Importante: la reconversión NO debe cerrar el mes actual.
+        # Se eliminan los cierres previos y se reescriben solo meses históricos.
+        # Si una versión anterior creó un cierre del mes actual, aquí queda removido
+        # para que puedas cerrarlo normalmente desde Cierre mensual.
         db.query(MonthlyClose).delete()
         db.commit()
 
-        for _, row in preview.iterrows():
+        for _, row in closes_to_write.iterrows():
             close = MonthlyClose(
                 period_key=str(row["Periodo"]),
                 start_date=row["Desde"],
@@ -717,12 +730,16 @@ def apply_total_reconversion(username: str, reason: str = ""):
         audit_log(
             username,
             "Reconversión total",
-            "sobrescribir cierres",
+            "sobrescribir cierres históricos",
             before={"cierres_anteriores": before_closes},
-            after={"cierres_nuevos": preview.to_dict("records")},
+            after={
+                "cierres_nuevos_historicos": closes_to_write.to_dict("records"),
+                "periodo_actual_no_cerrado": current_key,
+                "vista_previa_completa": preview.to_dict("records"),
+            },
             reason=reason or "Reconversión total solicitada por administrador."
         )
-        return len(preview)
+        return len(closes_to_write)
     except Exception:
         db.rollback()
         raise
@@ -2364,12 +2381,13 @@ def page_monthly_close(user):
 def page_reconversion(user):
     header(
         "Reconversión total",
-        "Recalcula todos los cierres, la deuda de Javier y el ROI usando el metraje y costos actuales."
+        "Recalcula cierres históricos, deuda de Javier y ROI sin cerrar el mes actual."
     )
 
     st.warning(
-        "Este módulo sobrescribe los cierres mensuales con nuevos cálculos. "
-        "No elimina ventas, gastos ni abonos/pagos hechos a Javier."
+        "Este módulo sobrescribe los cierres mensuales históricos con nuevos cálculos. "
+        "No elimina ventas, gastos ni abonos/pagos hechos a Javier. "
+        "El mes actual queda solo como vista previa y NO se marca como cerrado."
     )
 
     current_price = get_money_setting("price_per_meter", 6.0)
@@ -2422,9 +2440,16 @@ def page_reconversion(user):
         st.info("No hay ventas, gastos ni cierres para recalcular.")
         return
 
-    total_javier = float(preview["Total Javier + ROI"].sum())
-    total_roi = float(preview["ROI Javier"].sum())
-    total_rene = float(preview["Ganancia Rene"].sum())
+    current_key = current_period_key()
+    historical_preview = preview[preview["Periodo"].astype(str) != current_key].copy()
+    current_preview = preview[preview["Periodo"].astype(str) == current_key].copy()
+
+    # El saldo proyectado de Javier se calcula solo con cierres históricos,
+    # porque el mes actual seguirá abierto hasta que uses Cierre mensual.
+    total_javier = float(historical_preview["Total Javier + ROI"].sum()) if not historical_preview.empty else 0.0
+    total_roi = float(historical_preview["ROI Javier"].sum()) if not historical_preview.empty else 0.0
+    total_rene = float(historical_preview["Ganancia Rene"].sum()) if not historical_preview.empty else 0.0
+    current_javier_preview = float(current_preview["Total Javier + ROI"].sum()) if not current_preview.empty else 0.0
     payments = payments_dataframe("Javier")
     paid_javier = 0.0 if payments.empty else float(payments["Monto"].sum())
     opening = get_money_setting("opening_debt_javier", 0.0)
@@ -2442,7 +2467,8 @@ def page_reconversion(user):
 
     st.caption(
         f"Pagos/abonos ya registrados a Javier conservados: {format_usd(paid_javier)}. "
-        "La reconversión no modifica esos pagos."
+        "La reconversión no modifica esos pagos. "
+        f"Mes actual ({current_key}) queda abierto; vista previa Javier + ROI del mes actual: {format_usd(current_javier_preview)}."
     )
     st.dataframe(preview, width="stretch", hide_index=True)
 
@@ -2471,7 +2497,8 @@ def page_reconversion(user):
             try:
                 count = apply_total_reconversion(user["username"], reason.strip())
                 st.success(
-                    f"Reconversión aplicada. Se recalcularon {count} cierre(s). "
+                    f"Reconversión aplicada. Se recalcularon {count} cierre(s) histórico(s). "
+                    f"El mes actual ({current_period_key()}) quedó abierto para cierre normal. "
                     "Los pagos/abonos de Javier no fueron modificados."
                 )
                 st.rerun()
