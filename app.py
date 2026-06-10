@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 from datetime import date, datetime
+import calendar
 from io import BytesIO
 from urllib.parse import urlparse
 
@@ -41,6 +42,7 @@ st.set_page_config(
 APP_NAME = "DTF Control ROI"
 DEFAULT_ADMIN_USER = "admin"
 DEFAULT_ADMIN_PASS = "admin123"
+APP_VERSION = "Fix15 - Reconversión visible"
 
 Base = declarative_base()
 
@@ -555,7 +557,7 @@ def javier_account_summary():
 
 
 
-def calculate_report(df: pd.DataFrame, expenses_df: pd.DataFrame = None):
+def calculate_report(df: pd.DataFrame, expenses_df: pd.DataFrame = None, recovered_before_override=None):
     price = get_money_setting("price_per_meter", 6.0)
     cost = get_money_setting("cost_per_meter", 2.0)
     investment = get_money_setting("equipment_investment", 0.0)
@@ -571,7 +573,11 @@ def calculate_report(df: pd.DataFrame, expenses_df: pd.DataFrame = None):
 
     # Recuperación del equipo: porcentaje de la utilidad real después de gastos.
     planned_roi = max(net_profit_before_roi, 0) * (roi_percent / 100.0)
-    recovered_before = get_recovered_total_from_closed_months()
+    recovered_before = (
+        float(recovered_before_override)
+        if recovered_before_override is not None
+        else get_recovered_total_from_closed_months()
+    )
     remaining_before = max(investment - recovered_before, 0)
     roi_recovery = max(min(planned_roi, remaining_before), 0)
 
@@ -605,6 +611,123 @@ def calculate_report(df: pd.DataFrame, expenses_df: pd.DataFrame = None):
         "cost": cost,
     }
 
+
+
+def month_bounds(year: int, month: int):
+    last_day = calendar.monthrange(int(year), int(month))[1]
+    return date(int(year), int(month), 1), date(int(year), int(month), last_day)
+
+
+def get_all_activity_periods():
+    """
+    Devuelve todos los meses que tienen ventas, gastos o cierres existentes.
+    Se usa para la reconversión total sin tocar los abonos pagados a Javier.
+    """
+    periods = set()
+    db = SessionLocal()
+    try:
+        for row in db.query(Sale.sale_date).all():
+            if row[0]:
+                periods.add(f"{row[0].year:04d}-{row[0].month:02d}")
+        for row in db.query(Expense.expense_date).all():
+            if row[0]:
+                periods.add(f"{row[0].year:04d}-{row[0].month:02d}")
+        for row in db.query(MonthlyClose.period_key).all():
+            if row[0]:
+                periods.add(str(row[0]))
+        return sorted(periods)
+    finally:
+        db.close()
+
+
+def build_reconversion_preview():
+    """
+    Recalcula todos los meses desde cero, en orden cronológico, usando:
+    - metraje actualmente cargado
+    - gastos actualmente cargados
+    - precio/costo/ROI actuales de Configuración
+
+    No lee ni modifica pagos. Solo prepara la vista previa de cierres.
+    """
+    periods = get_all_activity_periods()
+    rows = []
+    investment = get_money_setting("equipment_investment", 0.0)
+    recovered_before = 0.0
+
+    for period_key in periods:
+        year, month = [int(x) for x in period_key.split("-")]
+        start, end = month_bounds(year, month)
+        df = sales_dataframe(start, end)
+        expenses_df = expenses_dataframe(start, end)
+        report = calculate_report(df, expenses_df, recovered_before_override=recovered_before)
+        recovered_before = min(recovered_before + float(report["roi_recovery"]), investment) if investment > 0 else 0.0
+        rows.append({
+            "Periodo": period_key,
+            "Desde": start,
+            "Hasta": end,
+            "Metros": report["total_meters"],
+            "Venta bruta": report["revenue"],
+            "Costo producción": report["production_cost"],
+            "Gastos deducibles": report["deductible_expenses"],
+            "Utilidad antes ROI": report["net_profit_before_roi"],
+            "ROI Javier": report["roi_recovery"],
+            "Utilidad a repartir": report["distributable_profit"],
+            "Ganancia Javier": report["partner_share"],
+            "Total Javier + ROI": report["javier_total_with_roi"],
+            "Ganancia Rene": report["partner_share"],
+            "ROI acumulado": report["recovered_total_after"],
+        })
+
+    return pd.DataFrame(rows)
+
+
+def apply_total_reconversion(username: str, reason: str = ""):
+    """
+    Sobrescribe todos los cierres mensuales con base en la data actual.
+    Conserva intactos los abonos/pagos hechos a Javier.
+    """
+    preview = build_reconversion_preview()
+    db = SessionLocal()
+    try:
+        before_closes = closes_dataframe().to_dict("records")
+        db.query(MonthlyClose).delete()
+        db.commit()
+
+        for _, row in preview.iterrows():
+            close = MonthlyClose(
+                period_key=str(row["Periodo"]),
+                start_date=row["Desde"],
+                end_date=row["Hasta"],
+                total_meters=float(row["Metros"] or 0),
+                revenue=float(row["Venta bruta"] or 0),
+                production_cost=float(row["Costo producción"] or 0),
+                deductible_expenses=float(row["Gastos deducibles"] or 0),
+                net_profit_before_roi=float(row["Utilidad antes ROI"] or 0),
+                roi_recovery=float(row["ROI Javier"] or 0),
+                distributable_profit=float(row["Utilidad a repartir"] or 0),
+                partner_share=float(row["Ganancia Javier"] or 0),
+                javier_credit=float(row["Total Javier + ROI"] or 0),
+                rene_credit=float(row["Ganancia Rene"] or 0),
+                notes="Reconversión total automática. Pagos/abonos de Javier conservados intactos.",
+                created_by=username,
+            )
+            db.add(close)
+
+        db.commit()
+        audit_log(
+            username,
+            "Reconversión total",
+            "sobrescribir cierres",
+            before={"cierres_anteriores": before_closes},
+            after={"cierres_nuevos": preview.to_dict("records")},
+            reason=reason or "Reconversión total solicitada por administrador."
+        )
+        return len(preview)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 def get_recovered_total_from_closed_months():
     investment = get_money_setting("equipment_investment", 0.0)
@@ -1043,13 +1166,30 @@ def metric_card(label, value, help_text=None):
     st.metric(label, value, help=help_text)
 
 
+def is_admin_user(user):
+    """Reconoce admin aunque el rol venga con mayúsculas/espacios o sea el usuario principal."""
+    role = str(user.get("role", "")).strip().lower()
+    username = str(user.get("username", "")).strip().lower()
+    return role == "admin" or username == "admin"
+
+
 def sidebar(user):
     st.sidebar.title("🖨️ DTF Control ROI")
-    st.sidebar.caption(f"{user['name']} · {user['role'].upper()}")
+    role_label = str(user.get("role", "")).strip().upper() or "SIN ROL"
+    st.sidebar.caption(f"{user['name']} · {role_label}")
+    st.sidebar.caption(APP_VERSION)
+
+    admin = is_admin_user(user)
 
     allowed_pages = ["Dashboard", "Cargar venta diaria", "Gastos del equipo", "Cuenta Javier", "Informe mensual", "ROI del equipo"]
-    if user["role"] == "admin":
-        allowed_pages += ["Cierre mensual", "Backup / Importar BD", "Auditoría", "Usuarios", "Configuración", "Base de datos"]
+    if admin:
+        allowed_pages += ["Cierre mensual", "Reconversión total", "Backup / Importar BD", "Auditoría", "Usuarios", "Configuración", "Base de datos"]
+
+    # Acceso directo visible para evitar que la reconversión se pierda dentro del menú.
+    if admin:
+        st.sidebar.info("Admin activo: herramientas avanzadas disponibles.")
+        if st.sidebar.button("🔁 Abrir Reconversión total", width="stretch"):
+            return "Reconversión total"
 
     page = st.sidebar.radio("Menú", allowed_pages)
 
@@ -2221,6 +2361,124 @@ def page_monthly_close(user):
 
 
 
+def page_reconversion(user):
+    header(
+        "Reconversión total",
+        "Recalcula todos los cierres, la deuda de Javier y el ROI usando el metraje y costos actuales."
+    )
+
+    st.warning(
+        "Este módulo sobrescribe los cierres mensuales con nuevos cálculos. "
+        "No elimina ventas, gastos ni abonos/pagos hechos a Javier."
+    )
+
+    current_price = get_money_setting("price_per_meter", 6.0)
+    current_cost = get_money_setting("cost_per_meter", 2.0)
+    current_roi = get_money_setting("roi_recovery_percent", 20.0)
+    investment = get_money_setting("equipment_investment", 0.0)
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        metric_card("Precio por metro", format_usd(current_price))
+    with c2:
+        metric_card("Costo por metro", format_usd(current_cost))
+    with c3:
+        metric_card("ROI aplicado", f"{current_roi:.2f}%")
+    with c4:
+        metric_card("Inversión equipo", format_usd(investment))
+
+    st.subheader("Ajuste rápido antes de reconvertir")
+    with st.form("reconversion_settings_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            new_price = st.number_input("Precio por metro ($)", min_value=0.0, value=current_price, step=0.10, format="%.2f")
+        with c2:
+            new_cost = st.number_input("Costo por metro ($)", min_value=0.0, value=current_cost, step=0.10, format="%.2f")
+        with c3:
+            new_roi = st.number_input("% ROI para Javier", min_value=0.0, max_value=100.0, value=current_roi, step=1.0, format="%.2f")
+        save_settings = st.form_submit_button("Guardar estos valores", width="stretch")
+
+    if save_settings:
+        set_setting("price_per_meter", f"{float(new_price):.2f}")
+        set_setting("cost_per_meter", f"{float(new_cost):.2f}")
+        set_setting("roi_recovery_percent", f"{float(new_roi):.2f}")
+        audit_log(
+            user["username"],
+            "Reconversión total",
+            "actualizar configuración",
+            after={"price_per_meter": new_price, "cost_per_meter": new_cost, "roi_recovery_percent": new_roi},
+            reason="Ajuste rápido previo a reconversión"
+        )
+        st.success(
+            f"Valores guardados. Costo por metro activo: {format_usd(float(new_cost))}. "
+            "La vista previa se actualizará con estos datos."
+        )
+        st.rerun()
+
+    preview = build_reconversion_preview()
+
+    st.subheader("Vista previa de la reconversión")
+    if preview.empty:
+        st.info("No hay ventas, gastos ni cierres para recalcular.")
+        return
+
+    total_javier = float(preview["Total Javier + ROI"].sum())
+    total_roi = float(preview["ROI Javier"].sum())
+    total_rene = float(preview["Ganancia Rene"].sum())
+    payments = payments_dataframe("Javier")
+    paid_javier = 0.0 if payments.empty else float(payments["Monto"].sum())
+    opening = get_money_setting("opening_debt_javier", 0.0)
+    projected_balance = opening + total_javier - paid_javier
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        metric_card("Total Javier + ROI", format_usd(total_javier))
+    with c2:
+        metric_card("ROI para Javier", format_usd(total_roi))
+    with c3:
+        metric_card("Ganancia Rene", format_usd(total_rene))
+    with c4:
+        metric_card("Saldo Javier tras pagos", format_usd(projected_balance))
+
+    st.caption(
+        f"Pagos/abonos ya registrados a Javier conservados: {format_usd(paid_javier)}. "
+        "La reconversión no modifica esos pagos."
+    )
+    st.dataframe(preview, width="stretch", hide_index=True)
+
+    st.subheader("Aplicar reconversión")
+    reason = st.text_area(
+        "Motivo / nota de auditoría",
+        value="Ajuste de metraje/costo por metro y recálculo total de deuda Javier + ROI.",
+        key="reconversion_reason"
+    )
+    confirm_text = st.text_input(
+        "Para confirmar escribe: RECONVERTIR",
+        key="reconversion_confirm_text"
+    )
+    keep_payments = st.checkbox(
+        "Confirmo que los pagos/abonos hechos a Javier deben conservarse intactos",
+        value=True,
+        key="reconversion_keep_payments"
+    )
+
+    if st.button("Aplicar reconversión total", width="stretch", type="primary"):
+        if confirm_text.strip().upper() != "RECONVERTIR":
+            st.error("Debes escribir RECONVERTIR para confirmar.")
+        elif not keep_payments:
+            st.error("Debes confirmar que los pagos/abonos de Javier se conservarán intactos.")
+        else:
+            try:
+                count = apply_total_reconversion(user["username"], reason.strip())
+                st.success(
+                    f"Reconversión aplicada. Se recalcularon {count} cierre(s). "
+                    "Los pagos/abonos de Javier no fueron modificados."
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo aplicar la reconversión: {e}")
+
+
 def page_backup(user):
     header("Backup / Importar BD", "Exporta o restaura toda la información del sistema.")
 
@@ -2519,17 +2777,19 @@ def main():
         page_monthly_report()
     elif page == "ROI del equipo":
         page_roi()
-    elif page == "Cierre mensual" and user["role"] == "admin":
+    elif page == "Cierre mensual" and is_admin_user(user):
         page_monthly_close(user)
-    elif page == "Backup / Importar BD" and user["role"] == "admin":
+    elif page == "Reconversión total" and is_admin_user(user):
+        page_reconversion(user)
+    elif page == "Backup / Importar BD" and is_admin_user(user):
         page_backup(user)
-    elif page == "Auditoría" and user["role"] == "admin":
+    elif page == "Auditoría" and is_admin_user(user):
         page_audit()
-    elif page == "Usuarios" and user["role"] == "admin":
+    elif page == "Usuarios" and is_admin_user(user):
         page_users()
-    elif page == "Configuración" and user["role"] == "admin":
+    elif page == "Configuración" and is_admin_user(user):
         page_settings()
-    elif page == "Base de datos" and user["role"] == "admin":
+    elif page == "Base de datos" and is_admin_user(user):
         page_database()
     else:
         st.error("No tienes permisos para ver este módulo.")
